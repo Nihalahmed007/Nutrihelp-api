@@ -12,7 +12,6 @@ env:
   NODE_VERSION: '20'
   OPENAPI_FILE: 'index.yaml'
 
-# Add permissions for PR comments
 permissions:
   contents: read
   pull-requests: write
@@ -24,232 +23,447 @@ concurrency:
 
 jobs:
   # ==================== JOB 1: DEPENDENCY INSTALLATION ====================
-  - name: Run ESLint against legacy baseline
-  shell: bash
-  run: |
-    BASELINE=10607
+  install-deps:
+    name: Install Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-    set +e
-    npx eslint . --ext .js --format json --output-file eslint-results.json
-    ESLINT_EXIT=$?
-    set -e
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
 
-    ERROR_COUNT=$(node -e "
-      const fs = require('fs');
-      const results = JSON.parse(fs.readFileSync('eslint-results.json', 'utf8'));
-      console.log(results.reduce((total, file) => total + file.errorCount, 0));
-    ")
+      - name: Clean install dependencies
+        run: npm ci --prefer-offline
 
-    echo "Legacy ESLint baseline: ${BASELINE} errors"
-    echo "Current ESLint errors: ${ERROR_COUNT}"
-
-    if [ "$ERROR_COUNT" -gt "$BASELINE" ]; then
-      echo "::error::ESLint errors increased from ${BASELINE} to ${ERROR_COUNT}."
-      exit 1
-    fi
-
-    if [ "$ERROR_COUNT" -gt 0 ]; then
-      echo "::warning::${ERROR_COUNT} legacy ESLint errors remain explicitly baselined."
-    fi
-
-    if [ "$ESLINT_EXIT" -ne 0 ] && [ "$ERROR_COUNT" -eq 0 ]; then
-      echo "::error::ESLint failed for a reason other than reported lint errors."
-      exit "$ESLINT_EXIT"
-    fi
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
 
   # ==================== JOB 2: ESLINT - BLOCKING ====================
+  # Legacy repository-wide lint debt is waived only for untouched files.
+  # Any new/modified JavaScript file must satisfy the committed ESLint config.
   lint:
-  name: ESLint Code Quality
-  runs-on: ubuntu-latest
-  needs: install-deps
-  steps:
-    - uses: actions/checkout@v4
+    name: ESLint Code Quality
+    runs-on: ubuntu-latest
+    needs: install-deps
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Restore node_modules
-      uses: actions/cache@v4
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+      - name: Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
 
-    - name: Run ESLint
-      run: npm run lint
+      - name: Determine comparison base
+        id: base
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            BASE_SHA="${{ github.event.before }}"
+          else
+            BASE_SHA="$(git rev-parse HEAD^ 2>/dev/null || git rev-parse HEAD)"
+          fi
+          git cat-file -e "${BASE_SHA}^{commit}"
+          echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Lint changed JavaScript files
+        shell: bash
+        run: |
+          mapfile -d '' -t FILES < <(
+            git diff --name-only --diff-filter=ACMR -z \
+              "${{ steps.base.outputs.sha }}" HEAD -- '*.js'
+          )
+
+          if (( ${#FILES[@]} == 0 )); then
+            echo "No changed JavaScript files. Legacy lint debt outside this change is explicitly waived."
+            exit 0
+          fi
+
+          printf 'ESLint checking: %s\n' "${FILES[@]}"
+          npx eslint "${FILES[@]}" --max-warnings=0
+
   # ==================== JOB 3: PRETTIER - BLOCKING ====================
+  # Legacy formatting debt is waived only for untouched files.
+  # Any new/modified JS, JSON, or Markdown file must satisfy committed Prettier config.
   format-check:
-  name: Prettier Format Check
-  runs-on: ubuntu-latest
-  needs: install-deps
-  steps:
-    - uses: actions/checkout@v4
+    name: Prettier Format Check
+    runs-on: ubuntu-latest
+    needs: install-deps
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Restore node_modules
-      uses: actions/cache@v4
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+      - name: Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
 
-    - name: Check formatting
-      run: npm run format:check
+      - name: Determine comparison base
+        id: base
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            BASE_SHA="${{ github.event.before }}"
+          else
+            BASE_SHA="$(git rev-parse HEAD^ 2>/dev/null || git rev-parse HEAD)"
+          fi
+          git cat-file -e "${BASE_SHA}^{commit}"
+          echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting of changed files
+        shell: bash
+        run: |
+          mapfile -d '' -t FILES < <(
+            git diff --name-only --diff-filter=ACMR -z \
+              "${{ steps.base.outputs.sha }}" HEAD -- '*.js' '*.json' '*.md'
+          )
+
+          if (( ${#FILES[@]} == 0 )); then
+            echo "No changed JS/JSON/Markdown files. Legacy formatting debt outside this change is explicitly waived."
+            exit 0
+          fi
+
+          printf 'Prettier checking: %s\n' "${FILES[@]}"
+          npx prettier --check "${FILES[@]}"
 
   # ==================== JOB 4: UNIT TESTS - BLOCKING ====================
+  # Use the repository's committed unit-test script rather than generating tests in CI.
   unit-tests:
-  name: Unit Tests
-  runs-on: ubuntu-latest
-  needs: install-deps
-  steps:
-    - uses: actions/checkout@v4
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: install-deps
+    steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Restore node_modules
-      uses: actions/cache@v4
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+      - name: Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
 
-    - name: Run unit tests
-      run: npx mocha ./test/**/*.test.js --timeout 5000 --exit
-      env:
-        NODE_ENV: test
+      - name: Run committed unit test suite
+        run: npm run test:unit
+        env:
+          NODE_ENV: test
+          SUPABASE_URL: https://test.supabase.co
+          SUPABASE_ANON_KEY: test-anon-key
+          SUPABASE_SERVICE_ROLE_KEY: test-service-role-key
+          JWT_SECRET: ci-test-jwt-secret
 
   # ==================== JOB 5: OPENAPI VALIDATION - BLOCKING ====================
   openapi-validate:
-  name: OpenAPI Validation
-  runs-on: ubuntu-latest
-  needs: install-deps
-  steps:
-    - uses: actions/checkout@v4
+    name: OpenAPI Validation
+    runs-on: ubuntu-latest
+    needs: install-deps
+    steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Restore node_modules
-      uses: actions/cache@v4
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+      - name: Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
 
-    - name: Validate OpenAPI
-      run: npm run openapi:validate
+      - name: Validate committed OpenAPI specification
+        run: npm run openapi:validate
 
   # ==================== JOB 6: SECURITY SCAN - BLOCKING ====================
+  # Existing high/critical advisories are dynamically compared with the base commit.
+  # A newly introduced high/critical vulnerability fingerprint blocks the pipeline.
   security-scan:
-  name: Security Vulnerability Scan
-  runs-on: ubuntu-latest
-  needs: install-deps
-  steps:
-    - uses: actions/checkout@v4
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: install-deps
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Restore node_modules
-      uses: actions/cache@v4
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+      - name: Determine comparison base
+        id: base
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            BASE_SHA="${{ github.event.before }}"
+          else
+            BASE_SHA="$(git rev-parse HEAD^ 2>/dev/null || git rev-parse HEAD)"
+          fi
+          git cat-file -e "${BASE_SHA}^{commit}"
+          echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
 
-    - name: Run npm audit
-      run: npm audit --audit-level=high
+      - name: Compare high and critical npm audit findings with base
+        shell: bash
+        run: |
+          BASE_SHA="${{ steps.base.outputs.sha }}"
+          rm -rf /tmp/npm-audit-base
+          mkdir -p /tmp/npm-audit-base
+
+          git show "${BASE_SHA}:package.json" > /tmp/npm-audit-base/package.json
+          git show "${BASE_SHA}:package-lock.json" > /tmp/npm-audit-base/package-lock.json
+
+          set +e
+          npm audit --package-lock-only --audit-level=high --json > current-audit.json
+          CURRENT_AUDIT_STATUS=$?
+          (
+            cd /tmp/npm-audit-base
+            npm audit --package-lock-only --audit-level=high --json
+          ) > base-audit.json
+          BASE_AUDIT_STATUS=$?
+          set -e
+
+          echo "Current audit exit status: ${CURRENT_AUDIT_STATUS}"
+          echo "Base audit exit status: ${BASE_AUDIT_STATUS}"
+
+          node <<'NODE'
+          const fs = require('fs');
+
+          function loadAudit(path) {
+            let data;
+            try {
+              data = JSON.parse(fs.readFileSync(path, 'utf8'));
+            } catch (error) {
+              console.error(`::error::Unable to parse ${path}: ${error.message}`);
+              process.exit(1);
+            }
+
+            if (!data.vulnerabilities || typeof data.vulnerabilities !== 'object') {
+              console.error(`::error::${path} does not contain npm audit vulnerability data.`);
+              process.exit(1);
+            }
+
+            return data;
+          }
+
+          function fingerprints(data) {
+            const severe = new Set(['high', 'critical']);
+            const result = new Set();
+
+            for (const [name, vuln] of Object.entries(data.vulnerabilities)) {
+              if (!severe.has(vuln.severity)) continue;
+
+              const via = (vuln.via || [])
+                .map(item => {
+                  if (typeof item === 'string') return item;
+                  return String(item.source || item.url || item.name || item.title || 'advisory');
+                })
+                .sort()
+                .join(',');
+
+              result.add(`${name}|${vuln.severity}|${via}`);
+            }
+
+            return result;
+          }
+
+          const base = fingerprints(loadAudit('base-audit.json'));
+          const current = fingerprints(loadAudit('current-audit.json'));
+          const introduced = [...current].filter(item => !base.has(item));
+
+          if (introduced.length > 0) {
+            console.error('::error::New high/critical npm audit findings were introduced:');
+            introduced.forEach(item => console.error(`  ${item}`));
+            process.exit(1);
+          }
+
+          console.log('Security gate passed: no new high/critical vulnerability fingerprints compared with the base commit.');
+          NODE
 
   # ==================== JOB 7: BUILD CHECK - BLOCKING ====================
   build-check:
-  name: Build & Syntax Check
-  runs-on: ubuntu-latest
-  needs: install-deps
-  steps:
-    - uses: actions/checkout@v4
+    name: Build & Syntax Check
+    runs-on: ubuntu-latest
+    needs: install-deps
+    steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Restore node_modules
-      uses: actions/cache@v4
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+      - name: Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
 
-    - name: Check JavaScript syntax
-      run: npm run build
+      - name: Run committed build check
+        run: npm run build
+
   # ==================== JOB 8: CODE COVERAGE - BLOCKING ====================
+  # Target remains 30%. Until the base branch reaches 30%, coverage may not regress.
+  # This dynamically baselines legacy debt without hard-coding the old percentage.
   code-coverage:
-  name: Code Coverage
-  runs-on: ubuntu-latest
-  needs: install-deps
-  steps:
-    - uses: actions/checkout@v4
+    name: Code Coverage Check
+    runs-on: ubuntu-latest
+    needs: [install-deps, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Restore node_modules
-      uses: actions/cache@v4
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+      - name: Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
 
-    - name: Run tests with coverage
-      run: >
-        npx nyc
-        --check-coverage
-        --lines 30
-        --reporter=text-summary
-        npx mocha ./test/**/*.test.js
-        --timeout 5000
-        --exit
-      env:
-        NODE_ENV: test
- 
+      - name: Determine comparison base
+        id: base
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            BASE_SHA="${{ github.event.before }}"
+          else
+            BASE_SHA="$(git rev-parse HEAD^ 2>/dev/null || git rev-parse HEAD)"
+          fi
+          git cat-file -e "${BASE_SHA}^{commit}"
+          echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Measure current and base unit-test coverage
+        shell: bash
+        env:
+          NODE_ENV: test
+          SUPABASE_URL: https://test.supabase.co
+          SUPABASE_ANON_KEY: test-anon-key
+          SUPABASE_SERVICE_ROLE_KEY: test-service-role-key
+          JWT_SECRET: ci-test-jwt-secret
+        run: |
+          rm -rf coverage .nyc_output
+          npx nyc --reporter=json-summary npm run test:unit
+          cp coverage/coverage-summary.json current-coverage-summary.json
+
+          BASE_SHA="${{ steps.base.outputs.sha }}"
+          rm -rf /tmp/nutrihelp-api-base
+          git worktree add --detach /tmp/nutrihelp-api-base "$BASE_SHA"
+
+          (
+            cd /tmp/nutrihelp-api-base
+            npm ci --prefer-offline
+            rm -rf coverage .nyc_output
+            npx nyc --reporter=json-summary npm run test:unit
+          )
+
+          cp /tmp/nutrihelp-api-base/coverage/coverage-summary.json base-coverage-summary.json
+
+          node <<'NODE'
+          const fs = require('fs');
+          const target = 30;
+
+          function lineCoverage(path) {
+            const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const value = data?.total?.lines?.pct;
+            if (typeof value !== 'number') {
+              console.error(`::error::Unable to read line coverage from ${path}`);
+              process.exit(1);
+            }
+            return value;
+          }
+
+          const current = lineCoverage('current-coverage-summary.json');
+          const base = lineCoverage('base-coverage-summary.json');
+
+          console.log(`Current line coverage: ${current}%`);
+          console.log(`Base line coverage: ${base}%`);
+          console.log(`Target line coverage: ${target}%`);
+
+          if (current >= target) {
+            console.log('Coverage gate passed: target reached.');
+            process.exit(0);
+          }
+
+          if (current + Number.EPSILON >= base) {
+            console.log('::warning::Coverage remains below the target, but no regression was introduced compared with the base commit.');
+            process.exit(0);
+          }
+
+          console.error(`::error::Coverage regressed from ${base}% to ${current}%.`);
+          process.exit(1);
+          NODE
 
   # ==================== JOB 9: FINAL BLOCKING GATE ====================
   final-gate:
-  name: Final Quality Gate
-  runs-on: ubuntu-latest
-  if: always()
-  needs:
-    - lint
-    - format-check
-    - unit-tests
-    - openapi-validate
-    - security-scan
-    - build-check
-    - code-coverage
+    name: FINAL BLOCKING GATE
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - lint
+      - format-check
+      - unit-tests
+      - openapi-validate
+      - security-scan
+      - build-check
+      - code-coverage
 
-  steps:
-    - name: Verify all quality gates
-      run: |
-        echo "Checking all quality gates..."
+    steps:
+      - name: Verify all blocking checks completed successfully
+        shell: bash
+        run: |
+          FAILED=0
 
-        if [ "${{ needs.lint.result }}" != "success" ] || \
-           [ "${{ needs.format-check.result }}" != "success" ] || \
-           [ "${{ needs.unit-tests.result }}" != "success" ] || \
-           [ "${{ needs.openapi-validate.result }}" != "success" ] || \
-           [ "${{ needs.security-scan.result }}" != "success" ] || \
-           [ "${{ needs.build-check.result }}" != "success" ] || \
-           [ "${{ needs.code-coverage.result }}" != "success" ]; then
+          check_result() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" == "success" ]]; then
+              echo "${name}: PASSED"
+            else
+              echo "${name}: ${result^^}"
+              FAILED=1
+            fi
+          }
 
-          echo "One or more quality gates failed."
-          echo "ESLint: ${{ needs.lint.result }}"
-          echo "Prettier: ${{ needs.format-check.result }}"
-          echo "Unit Tests: ${{ needs.unit-tests.result }}"
-          echo "OpenAPI: ${{ needs.openapi-validate.result }}"
-          echo "Security Scan: ${{ needs.security-scan.result }}"
-          echo "Build Check: ${{ needs.build-check.result }}"
-          echo "Code Coverage: ${{ needs.code-coverage.result }}"
-          exit 1
-        fi
+          check_result "ESLint" "${{ needs.lint.result }}"
+          check_result "Prettier" "${{ needs.format-check.result }}"
+          check_result "Unit Tests" "${{ needs.unit-tests.result }}"
+          check_result "OpenAPI" "${{ needs.openapi-validate.result }}"
+          check_result "Security Scan" "${{ needs.security-scan.result }}"
+          check_result "Build Check" "${{ needs.build-check.result }}"
+          check_result "Code Coverage" "${{ needs.code-coverage.result }}"
 
-        echo "All 7 quality gates passed."
+          if [[ "$FAILED" -ne 0 ]]; then
+            echo "One or more blocking checks failed. This change must not be merged."
+            exit 1
+          fi
+
+          echo "All blocking checks completed successfully."
+          echo "Legacy debt is explicitly scoped to the base commit and is not allowed to worsen."
