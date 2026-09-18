@@ -1,0 +1,1 @@
+const deliberateFailure = "ci-test"
